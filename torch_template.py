@@ -3,12 +3,20 @@ import numpy as np
 
 import torch
 from sklearn.metrics import confusion_matrix
+import pandas as pd
 
+def search(model_trainer, optimizers, create_model):
+    results = []
+    for case in optimizers:
+        model = create_model()
+        optimizer = case["type"](model.parameters(), **case["params"])
+        print("Training optimizer", optimizer)
+        result = model_trainer.train_model(model, optimizer)
+        results.append(result)
 
-# TODO pre-commit black, mypy, etc
 
 class ModelTrainer:
-    def __init__(self, device, n_labels, n_epochs = 10):
+    def __init__(self, device, n_labels, criterion, n_epochs = 10):
         self.print_interval = 50
         self.shortcut_quit = 1000000
         self.max_train_seconds = 60 * 60 * 5
@@ -17,11 +25,12 @@ class ModelTrainer:
         self.n_epochs = n_epochs
         self.min_increase_threshold = 0.05
         self.device = device
+        self.criterion = criterion
 
         self.num_workers = 2
         self.batch_size = 100
 
-    def train_model(self, model, criterion, optimizer, train_loader, test_loader):
+    def train_model(self, model, optimizer, train_loader, validation_loader):
         loss_history = []
         validation_history = []
         training_history = []
@@ -31,8 +40,7 @@ class ModelTrainer:
         minimal_increase = 0
         for epoch in range(self.n_epochs):
             print(f"starting epoch {epoch+1} of {self.n_epochs}")
-            loss_history.append(self._train_single_epoch(model, train_loader, self.device, optimizer, criterion))
-
+            loss_history.append(self._train_single_epoch(model, train_loader, self.device, optimizer))
 
         #     Calculate model accuracy on training samples
             outputs, targets = self._validate_model(model, train_loader, self.device)
@@ -41,7 +49,7 @@ class ModelTrainer:
             print(f"..\ttrain\t{accuracy}")
 
         #     Calculate model accuracy on validation samples
-            outputs, targets = self._validate_model(model, test_loader, self.device)
+            outputs, targets = self._validate_model(model, validation_loader, self.device)
             validation_accuracy, final_accuracy_by_label, final_conf_matrix = self._calculate_prediction_accuracy_by_label(outputs, targets)
             validation_history.append(validation_accuracy)
 
@@ -72,17 +80,17 @@ class ModelTrainer:
             "model": model
         }
 
-    def _train_single_epoch(self, mod, loader, device, optim, crit):
-        mod.train()
+    def _train_single_epoch(self, model, loader, optimizer):
+        model.train()
         losses = []
         for i, (images, targets) in enumerate(loader):
-            images, targets = images.to(device), targets.to(device)
-            output = mod(images)
-            loss = crit(output, targets)
+            images, targets = images.to(self.device), targets.to(self.device)
+            output = model(images)
+            loss = self.criterion(output, targets)
 
-            optim.zero_grad()
+            optimizer.zero_grad()
             loss.backward()
-            optim.step()
+            optimizer.step()
             
             losses.append(float(loss))
 
@@ -95,23 +103,24 @@ class ModelTrainer:
         print(f"..\tavg_l\t{sum(losses) / len(losses)}")  
         return losses
 
-
-    def _validate_model(self, mod, loader, device):
-        mod.eval()
+    def _validate_model(self, model, loader):
+        model.eval()
         predicted_values = np.empty((0, self.n_labels), float)
         expected_targets = np.empty((0,1), int)
         with torch.no_grad():
             for idx, (images, target) in enumerate(loader):
-                images, target = images.to(device), target.to(device)
+                images, target = images.to(self.device), target.to(self.device)
 
-                output = mod(images)
+                if (idx % self.print_interval) == 0 and idx > 0: 
+                    print(f"Starting batch {idx}")
+
+                output = model(images)
                 predicted_values =  np.append(predicted_values, output.cpu().numpy(), axis=0)
                 expected_targets = np.append(expected_targets, target.cpu())
                 if idx > self.shortcut_quit:
                     break
                     
         return predicted_values, expected_targets
-
 
     def _calculate_prediction_accuracy_by_label(self, predicted_prob, expected_labels):
         predicted_targets = np.argmax(predicted_prob, axis=1)
@@ -120,3 +129,10 @@ class ModelTrainer:
         correct = np.identity(self.n_labels) * matrix
         accuracy_by_label = correct.sum(axis=1) / matrix.sum(axis=1)
         return correct.sum()/total, accuracy_by_label, matrix,
+
+    def predict(self, model, test_loader):
+        predicted_values, expected_targets = self._validate_model(model, test_loader, self.device)
+        predictions = np.exp(predicted_values) / np.sum(np.exp(predicted_values))
+        index_to_prediction = [(expected_targets[idx], prediction) for idx, prediction in enumerate(predictions)]
+        index_to_prediction.sort(key=lambda x: x[0])
+        return pd.DataFrame([_[1] for _ in index_to_prediction], index = [_[0] for _ in index_to_prediction])
